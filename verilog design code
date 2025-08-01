@@ -1,0 +1,401 @@
+`define OPCODE_R_TYPE 6'b000000
+`define OPCODE_LOAD   6'b100011
+
+`define FUNCT_ADD     6'b100000
+`define FUNCT_SUB     6'b100010
+
+//-------------------------------------------------
+// 1. Top-Level Processor Module
+//-------------------------------------------------
+module Processor_Top(
+    input clk,
+    input rst
+);
+
+    // Wires for inter-module connections
+
+    // PC and Instruction Fetch
+    wire [31:0] pc_out;
+    wire [31:0] instruction;
+
+    // IF/ID Stage
+    wire [31:0] if_id_pc_plus_4;
+    wire [31:0] if_id_instruction;
+    
+    // ID/EX Stage
+    wire id_ex_reg_write, id_ex_mem_read;
+    wire [1:0] id_ex_alu_op;
+    wire [31:0] id_ex_read_data_1, id_ex_read_data_2;
+    wire [4:0] id_ex_rs, id_ex_rt, id_ex_rd;
+    wire [15:0] id_ex_imm;
+
+    // EX/WB Stage
+    wire ex_wb_reg_write, ex_wb_mem_read;
+    wire [31:0] ex_wb_alu_result;
+    wire [31:0] ex_wb_read_data_2;
+    wire [4:0] ex_wb_rd;
+    
+    // WB Stage
+    wire wb_reg_write;
+    wire [31:0] wb_write_data;
+    wire [4:0] wb_rd;
+
+    // Control and Hazard signals
+    wire pc_write, if_id_write;
+    wire [1:0] alu_op;
+    wire reg_write, mem_read;
+    
+    // Hazard Unit Outputs
+    wire stall;
+
+    // PC Logic
+    reg [31:0] pc;
+    assign pc_out = pc;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            pc <= 32'd0;
+        end else if (pc_write) begin
+            pc <= pc + 4;
+        end
+    end
+
+    // --- STAGE 1: INSTRUCTION FETCH (IF) ---
+    InstructionMemory inst_mem (
+        .address(pc_out),
+        .instruction(instruction)
+    );
+
+    // --- PIPELINE REGISTER: IF/ID ---
+    IF_ID_Register if_id_reg (
+        .clk(clk),
+        .rst(rst),
+        .stall(stall),
+        .if_id_write(if_id_write),
+        .pc_in(pc_out + 4),
+        .instruction_in(instruction),
+        .pc_out(if_id_pc_plus_4),
+        .instruction_out(if_id_instruction)
+    );
+
+    // --- STAGE 2: INSTRUCTION DECODE (ID) ---
+    // Control Unit (simplified, part of decode logic)
+    wire [5:0] opcode = if_id_instruction[31:26];
+    wire [5:0] funct = if_id_instruction[5:0];
+    assign reg_write = (opcode == `OPCODE_R_TYPE || opcode == `OPCODE_LOAD);
+    assign mem_read = (opcode == `OPCODE_LOAD);
+    assign alu_op = (opcode == `OPCODE_R_TYPE) ? 2'b10 : 2'b00; // 10 for R-type, 00 for load/store
+
+    // Register File
+    RegisterFile reg_file (
+        .clk(clk),
+        .rst(rst),
+        .rs_addr(if_id_instruction[25:21]),
+        .rt_addr(if_id_instruction[20:16]),
+        .rd_addr(wb_rd),
+        .write_data(wb_write_data),
+        .reg_write(wb_reg_write),
+        .rs_data(read_data_1),
+        .rt_data(read_data_2)
+    );
+
+    // Hazard Detection Unit
+    HazardDetectionUnit hazard_unit (
+        .id_ex_mem_read(id_ex_mem_read),
+        .id_ex_rt(id_ex_rt), // For LOAD, rt is the destination
+        .if_id_rs(if_id_instruction[25:21]),
+        .if_id_rt(if_id_instruction[20:16]),
+        .pc_write(pc_write),
+        .if_id_write(if_id_write),
+        .stall(stall)
+    );
+
+    // --- PIPELINE REGISTER: ID/EX ---
+    ID_EX_Register id_ex_reg (
+        .clk(clk),
+        .rst(rst),
+        .stall(stall),
+        .reg_write_in(reg_write),
+        .mem_read_in(mem_read),
+        .alu_op_in(alu_op),
+        .read_data_1_in(read_data_1),
+        .read_data_2_in(read_data_2),
+        .rs_in(if_id_instruction[25:21]),
+        .rt_in(if_id_instruction[20:16]),
+        .rd_in(if_id_instruction[15:11]),
+        .imm_in(if_id_instruction[15:0]),
+        .reg_write_out(id_ex_reg_write),
+        .mem_read_out(id_ex_mem_read),
+        .alu_op_out(id_ex_alu_op),
+        .read_data_1_out(id_ex_read_data_1),
+        .read_data_2_out(id_ex_read_data_2),
+        .rs_out(id_ex_rs),
+        .rt_out(id_ex_rt),
+        .rd_out(id_ex_rd),
+        .imm_out(id_ex_imm)
+    );
+    
+    // --- STAGE 3: EXECUTE (EX) ---
+    wire [31:0] alu_result;
+    wire [31:0] alu_b_operand;
+    wire [5:0] ex_funct = id_ex_imm[5:0]; // For R-type, funct is in immediate field
+    
+    assign alu_b_operand = id_ex_read_data_2; // For R-type
+
+    ALU alu (
+        .a(id_ex_read_data_1),
+        .b(alu_b_operand),
+        .alu_op(id_ex_alu_op),
+        .funct(ex_funct),
+        .result(alu_result)
+    );
+
+    // --- PIPELINE REGISTER: EX/WB ---
+    EX_WB_Register ex_wb_reg (
+        .clk(clk),
+        .rst(rst),
+        .reg_write_in(id_ex_reg_write),
+        .mem_read_in(id_ex_mem_read),
+        .alu_result_in(alu_result),
+        .read_data_2_in(id_ex_read_data_2), // Pass through for potential store
+        .rd_in(id_ex_rd),
+        .reg_write_out(ex_wb_reg_write),
+        .mem_read_out(ex_wb_mem_read),
+        .alu_result_out(ex_wb_alu_result),
+        .read_data_2_out(ex_wb_read_data_2),
+        .rd_out(ex_wb_rd)
+    );
+
+    // --- STAGE 4: WRITE BACK (WB) ---
+    wire [31:0] mem_data_out;
+    
+    DataMemory data_mem (
+        .clk(clk),
+        .address(ex_wb_alu_result), // From ALU in EX stage
+        .write_data(ex_wb_read_data_2),
+        .mem_read(ex_wb_mem_read),
+        .mem_write(1'b0), // Not implementing stores
+        .read_data(mem_data_out)
+    );
+
+    // Mux to select what to write back to the register file
+    assign wb_write_data = ex_wb_mem_read ? mem_data_out : ex_wb_alu_result;
+    assign wb_reg_write = ex_wb_reg_write;
+    assign wb_rd = ex_wb_rd;
+
+endmodule
+
+//-------------------------------------------------
+// 2. Instruction Memory
+//-------------------------------------------------
+module InstructionMemory(
+    input [31:0] address,
+    output reg [31:0] instruction
+);
+    reg [31:0] memory [0:7];
+
+    initial begin
+        // I1: LOAD R1, 0(R0) -> Op(6) R0(5) R1(5) Offset(16)
+        memory[0] = {`OPCODE_LOAD, 5'd0, 5'd1, 16'd0}; 
+        // I2: ADD R2, R1, R3 -> Op(6) R1(5) R3(5) R2(5) 0(5) Funct(6)
+        memory[1] = {`OPCODE_R_TYPE, 5'd1, 5'd3, 5'd2, 5'd0, `FUNCT_ADD};
+        // I3: SUB R4, R5, R6 -> Op(6) R5(5) R6(5) R4(5) 0(5) Funct(6)
+        memory[2] = {`OPCODE_R_TYPE, 5'd5, 5'd6, 5'd4, 5'd0, `FUNCT_SUB};
+    end
+
+    always @(*) begin
+        instruction = memory[address >> 2]; // Word-addressed
+    end
+endmodule
+
+//-------------------------------------------------
+// 3. Register File
+//-------------------------------------------------
+module RegisterFile(
+    input clk, rst,
+    input [4:0] rs_addr, rt_addr, rd_addr,
+    input [31:0] write_data,
+    input reg_write,
+    output [31:0] rs_data, rt_data
+);
+    reg [31:0] registers [0:31];
+    
+    initial begin
+        registers[0] <= 32'd0;
+        registers[3] <= 32'd10;
+        registers[5] <= 32'd50;
+        registers[6] <= 32'd25;
+    end
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            // Simplified reset
+            registers[0] <= 32'd0;
+            registers[3] <= 32'd10;
+            registers[5] <= 32'd50;
+            registers[6] <= 32'd25;
+        end else if (reg_write && rd_addr != 5'd0) begin
+            registers[rd_addr] <= write_data;
+        end
+    end
+
+    assign rs_data = registers[rs_addr];
+    assign rt_data = registers[rt_addr];
+endmodule
+
+//-------------------------------------------------
+// 4. ALU
+//-------------------------------------------------
+module ALU(
+    input [31:0] a, b,
+    input [1:0] alu_op,
+    input [5:0] funct,
+    output reg [31:0] result
+);
+    always @(*) begin
+        case (alu_op)
+            2'b00: result = a + b; // For LOAD/STORE address calculation
+            2'b10: begin // R-type
+                case (funct)
+                    `FUNCT_ADD: result = a + b;
+                    `FUNCT_SUB: result = a - b;
+                    default: result = 32'hxxxxxxxx;
+                endcase
+            end
+            default: result = 32'hxxxxxxxx;
+        endcase
+    end
+endmodule
+
+//-------------------------------------------------
+// 5. Data Memory
+//-------------------------------------------------
+module DataMemory(
+    input clk,
+    input [31:0] address,
+    input [31:0] write_data,
+    input mem_read, mem_write,
+    output reg [31:0] read_data
+);
+    reg [31:0] memory [0:255];
+    
+    initial begin
+        memory[0] = 32'd77; // Address for LOAD R1, 0(R0)
+    end
+
+    always @(*) begin
+        if (mem_read) begin
+            read_data = memory[address];
+        end else begin
+            read_data = 32'hxxxxxxxx;
+        end
+    end
+
+    always @(posedge clk) begin
+        if (mem_write) begin
+            memory[address] <= write_data;
+        end
+    end
+endmodule
+
+//-------------------------------------------------
+// 6. Hazard Detection Unit
+//-------------------------------------------------
+module HazardDetectionUnit(
+    input id_ex_mem_read,
+    input [4:0] id_ex_rt, // For LOAD, Rd is in the rt field
+    input [4:0] if_id_rs, if_id_rt,
+    output reg pc_write,
+    output reg if_id_write,
+    output reg stall
+);
+    always @(*) begin
+        // Load-Use Hazard Detection
+        if (id_ex_mem_read && 
+           ((id_ex_rt == if_id_rs) || (id_ex_rt == if_id_rt))) 
+        begin
+            pc_write = 1'b0;    // Don't update PC
+            if_id_write = 1'b0; // Don't update IF/ID register
+            stall = 1'b1;       // Stall signal for ID/EX register control
+        end else begin
+            pc_write = 1'b1;
+            if_id_write = 1'b1;
+            stall = 1'b0;
+        end
+    end
+endmodule
+
+//-------------------------------------------------
+// 7. Pipeline Registers
+//-------------------------------------------------
+module IF_ID_Register(
+    input clk, rst, stall, if_id_write,
+    input [31:0] pc_in, instruction_in,
+    output reg [31:0] pc_out, instruction_out
+);
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            pc_out <= 0;
+            instruction_out <= 0;
+        end else if (if_id_write) begin
+            pc_out <= pc_in;
+            instruction_out <= instruction_in;
+        end
+    end
+endmodule
+
+module ID_EX_Register(
+    input clk, rst, stall,
+    input reg_write_in, mem_read_in,
+    input [1:0] alu_op_in,
+    input [31:0] read_data_1_in, read_data_2_in,
+    input [4:0] rs_in, rt_in, rd_in,
+    input [15:0] imm_in,
+    output reg reg_write_out, mem_read_out,
+    output reg [1:0] alu_op_out,
+    output reg [31:0] read_data_1_out, read_data_2_out,
+    output reg [4:0] rs_out, rt_out, rd_out,
+    output reg [15:0] imm_out
+);
+    always @(posedge clk or posedge rst) begin
+        if (rst || stall) begin
+            // Insert a bubble on stall
+            reg_write_out <= 0;
+            mem_read_out <= 0;
+            alu_op_out <= 0;
+        end else begin
+            reg_write_out <= reg_write_in;
+            mem_read_out <= mem_read_in;
+            alu_op_out <= alu_op_in;
+            read_data_1_out <= read_data_1_in;
+            read_data_2_out <= read_data_2_in;
+            rs_out <= rs_in;
+            rt_out <= rt_in;
+            rd_out <= rd_in;
+            imm_out <= imm_in;
+        end
+    end
+endmodule
+
+module EX_WB_Register(
+    input clk, rst,
+    input reg_write_in, mem_read_in,
+    input [31:0] alu_result_in, read_data_2_in,
+    input [4:0] rd_in,
+    output reg reg_write_out, mem_read_out,
+    output reg [31:0] alu_result_out, read_data_2_out,
+    output reg [4:0] rd_out
+);
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            reg_write_out <= 0;
+            mem_read_out <= 0;
+        end else begin
+            reg_write_out <= reg_write_in;
+            mem_read_out <= mem_read_in;
+            alu_result_out <= alu_result_in;
+            read_data_2_out <= read_data_2_in;
+            rd_out <= rd_in;
+        end
+    end
+endmodule
