@@ -1,0 +1,36 @@
+`timescale 1ns/1ps
+module Testbench;
+    reg clk;
+    reg rst;
+
+    Processor_Top dut (.clk(clk), .rst(rst));
+
+    // Clock generation
+    initial begin
+        clk = 0;
+        forever #5 clk = ~clk;
+    end
+
+    // Test sequence
+    initial begin
+        // VCD file generation setup
+        $dumpfile("processor_waveform.vcd");
+        $dumpvars(0, dut);
+
+        rst = 1;
+        #10;
+        rst = 0;
+        #100; // Run for some cycles
+        $finish;
+    end
+    
+    // Monitoring
+    initial begin
+        $monitor("Time=%0t, PC=%d, Stall=%b, IF/ID_Inst=%h, ID/EX_Inst=%h, EX/WB_Inst=%h, WB_Inst=%h",
+                 $time, dut.pc, dut.stall, 
+                 dut.if_id_reg.instruction_out, 
+                 {dut.id_ex_reg.reg_write_out, dut.id_ex_reg.mem_read_out, dut.id_ex_reg.alu_op_out}, // simplified view
+                 {dut.ex_wb_reg.reg_write_out, dut.ex_wb_reg.mem_read_out}, // simplified view
+                 {dut.wb_reg_write, dut.wb_rd, dut.wb_write_data}); // simplified view
+    end
+endmodule
